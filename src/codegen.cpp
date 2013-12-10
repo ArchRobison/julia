@@ -893,9 +893,13 @@ static bool jltupleisbits(jl_value_t *jt, bool allow_unsized = true)
     size_t ntypes = jl_tuple_len(jt);
     if (ntypes == 0)
         return allow_unsized;
-    for (size_t i = 0; i < ntypes; ++i)
-        if (!jltupleisbits(jl_tupleref(jt,i),allow_unsized))
+    for (size_t i = 0; i < ntypes; ++i) {
+        jl_value_t *v = jl_tupleref(jt,i);
+        if (jl_is_tuple(v))
             return false;
+        if (!jltupleisbits(v,allow_unsized))
+            return false;
+    }
     return true; 
 }
 
