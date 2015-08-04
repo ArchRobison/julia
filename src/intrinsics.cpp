@@ -269,7 +269,17 @@ static Value *emit_unbox(Type *to, Value *x, jl_value_t *jt)
     }
     if (ty != jl_pvalue_llvmt) {
         if (ty->isPointerTy() && to->isAggregateType()) {
-            x = builder.CreateLoad(x); // something stack allocated
+            x = builder.CreateLoad(x,"unbox");
+            ty = x->getType();
+        }
+        else if (ty->isPointerTy() && to->isVectorTy()) {
+            Type* elty = ty->getContainedType(0);
+            if (elty->isArrayTy())
+                x = builder.CreateBitCast(x,PointerType::get(to,0));
+            else
+                assert(elty->isVectorTy());
+            unsigned align = LLVMDataLayout()->getABITypeAlignment(elty);
+            x = builder.CreateAlignedLoad(x,align,"unbox");
             ty = x->getType();
         }
         else {

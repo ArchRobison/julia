@@ -333,7 +333,7 @@ static Value *julia_to_native(Type *ty, jl_value_t *jt, Value *jv,
         return boxed(jv,ctx);
     }
 
-    if (!tojulia && vt != jl_pvalue_llvmt && julia_type_to_llvm(aty)->isAggregateType()) {
+    if (!tojulia && vt != jl_pvalue_llvmt && julia_type_to_llvm_quick(aty)->isAggregateType()) {
         // this value is expected to be a pointer in the julia codegen,
         // so it needs to be extracted first if not tojulia
         vt = vt->getContainedType(0);
@@ -380,6 +380,15 @@ static Value *julia_to_native(Type *ty, jl_value_t *jt, Value *jv,
             else {
                 return jv;
             }
+        }
+        else if (vt->isVectorTy()) {
+            Value *mem = emit_static_alloca(vt, ctx);
+            builder.CreateStore(jv, mem);
+            Value* ptr = builder.CreateBitCast(mem, ty->getPointerTo());
+            if (byRef)
+                return ptr;
+            else
+                return builder.CreateLoad(ptr);
         }
 
         emit_error("ccall: argument type did not match declaration", ctx);

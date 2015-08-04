@@ -2,6 +2,17 @@
 
 // utility procedures used in code generation
 
+// Get LLVM DataLayout
+static const DataLayout* LLVMDataLayout() {
+#ifdef LLVM37
+    return jl_TargetMachine->getDataLayout();
+#elif LLVM35
+    return &jl_data_layout->getDataLayout();
+#else
+    return jl_data_layout;
+#endif
+}
+
 #if defined(USE_MCJIT) && defined(_OS_WINDOWS_)
 template<class T> // for GlobalObject's
 static T* addComdat(T *G)
@@ -528,6 +539,7 @@ static Value *julia_gv(const char *cname, void *addr)
     if (it != jl_value_to_llvm.end())
         return builder.CreateLoad(it->second.gv);
 
+//printf("\tcname=%s, globalUnique=%d\n", cname, globalUnique);
     std::stringstream gvname;
     gvname << cname << globalUnique++;
     // no existing GlobalVariable, create one and store it
@@ -748,12 +760,7 @@ static Type *julia_struct_to_llvm(jl_value_t *jt)
             }
             else {
                 if (isvector && lasttype != T_int1 && lasttype != T_void) {
-                    // TODO: currently we get LLVM assertion failures for other vector sizes
-                    bool validVectorSize = (ntypes == 2 || ntypes == 4 || ntypes == 6);
-                    if (0 && lasttype->isSingleValueType() && !lasttype->isVectorTy() && validVectorSize) // currently disabled due to load/store alignment issues
-                        jst->struct_decl = VectorType::get(lasttype, ntypes);
-                    else
-                        jst->struct_decl = ArrayType::get(lasttype, ntypes);
+                    jst->struct_decl = ArrayType::get(lasttype, ntypes);
                 }
                 else {
                     jst->struct_decl = StructType::get(jl_LLVMContext,ArrayRef<Type*>(&latypes[0],ntypes));
@@ -763,6 +770,32 @@ static Type *julia_struct_to_llvm(jl_value_t *jt)
         return (Type*)jst->struct_decl;
     }
     return julia_type_to_llvm(jt);
+}
+
+static Type *llvm_quick(Type *ty, jl_value_t *jt) {
+    if (jl_is_tuple_type(jt) && ty->isArrayTy()) {
+        uint64_t n = ty->getArrayNumElements();
+        // FIXME - add n==16 for sake of AVX512
+        if (n==2 || n==4 || n==8) {
+            Type* eltype = ty->getArrayElementType();
+            if (eltype->isIntegerTy() || eltype->isFloatingPointTy() || eltype->isPointerTy()) {
+            //if ((eltype->isIntegerTy() && n>=4) || eltype->isFloatingPointTy()) {
+            //if (eltype->isFloatingPointTy()) {
+                return VectorType::get(eltype, n);
+            }
+        }
+    }
+    return ty;
+}
+
+static Type *julia_type_to_llvm_quick(jl_value_t *jt) {
+    Type *ty = julia_type_to_llvm(jt);
+    return llvm_quick(ty,jt);
+}
+
+static Type *julia_struct_to_llvm_quick(jl_value_t *jt) {
+    Type *ty = julia_struct_to_llvm(jt);
+    return llvm_quick(ty,jt);
 }
 
 // NOTE: llvm cannot express all julia types (for example unsigned),
@@ -1262,7 +1295,7 @@ static void typed_store(Value *ptr, Value *idx_0based, Value *rhs,
                         Value* parent,  // for the write barrier, NULL if no barrier needed
                         size_t alignment = 0)
 {
-    Type *elty = julia_type_to_llvm(jltype);
+    Type *elty = julia_type_to_llvm_quick(jltype);
     assert(elty != NULL);
     if (elty == T_void)
         return;
@@ -1905,7 +1938,7 @@ static Value *boxed(Value *v, jl_codectx_t *ctx, jl_value_t *jt)
 
     Type *llvmt = julia_type_to_llvm(jt);
     if (llvmt->isAggregateType() && v->getType()->isPointerTy()) {
-        v = builder.CreateLoad(v);
+        v = builder.CreateAlignedLoad(v,1,"debox");
     }
     return allocate_box_dynamic(literal_pointer_val(jt), ConstantInt::get(T_size, jl_datatype_size(jt)), v);
 }
@@ -2039,7 +2072,7 @@ static Value *emit_new_struct(jl_value_t *ty, size_t nargs, jl_value_t **args, j
     size_t nf = jl_datatype_nfields(sty);
     if (nf > 0) {
         if (jl_isbits(sty)) {
-            Type *lt = julia_type_to_llvm(ty);
+            Type *lt = julia_type_to_llvm_quick(ty);
             size_t na = nargs-1 < nf ? nargs-1 : nf;
             Value *strct = UndefValue::get(lt == T_void ? NoopType : lt);
             unsigned idx = 0;
@@ -2050,7 +2083,14 @@ static Value *emit_new_struct(jl_value_t *ty, size_t nargs, jl_value_t **args, j
                 if (!jl_subtype(expr_type(args[i+1],ctx), jtype, 0))
                     emit_typecheck(fval, jtype, "new", ctx);
                 if (!type_is_ghost(fty)) {
-                    fval = emit_unbox(fty, fval, jtype);
+                    if(fval->getType()->isVectorTy() && fty->isArrayTy()) {
+                        // FIXME use llvm_type_rewrite?
+                        Value *mem = emit_static_alloca(fty, ctx);
+                        builder.CreateStore(fval, builder.CreatePointerCast(mem, fval->getType()->getPointerTo()));
+                        fval = builder.CreateLoad(mem);
+                    } else {
+                        fval = emit_unbox(fty, fval, jtype);
+                    }
                     if (fty == T_int1)
                         fval = builder.CreateZExt(fval, T_int8);
                     if (lt->isVectorTy())

@@ -565,7 +565,7 @@ static Value *alloc_local(jl_sym_t *s, jl_codectx_t *ctx)
     jl_value_t *jt = vi.declType;
     Value *lv = NULL;
     assert(store_unboxed_p(s,ctx));
-    Type *vtype = julia_struct_to_llvm(jt);
+    Type *vtype = julia_struct_to_llvm_quick(jt);
     assert(vtype != jl_pvalue_llvmt);
     if (!type_is_ghost(vtype)) {
         // CreateAlloca is OK here because alloc_local is only called during prologue setup
@@ -2511,7 +2511,7 @@ static Value *emit_call_function_object(jl_function_t *f, Value *theF, Value *th
         for(size_t i=0; i < nargs; i++) {
             Type *at = cft->getParamType(idx);
             jl_value_t *jt = jl_nth_slot_type(f->linfo->specTypes,i);
-            Type *et = julia_type_to_llvm(jt);
+            Type *et = julia_type_to_llvm_quick(jt);
             if (et == T_void || et->isEmptyTy()) {
                 // Still emit the expression in case it has side effects
                 emit_expr(args[i+1], ctx);
@@ -2537,7 +2537,8 @@ static Value *emit_call_function_object(jl_function_t *f, Value *theF, Value *th
                     argvals[idx] = emit_reg2mem(emit_unbox(et, arg, jt), ctx);
             }
             else {
-                assert(at == et);
+//OUCH - et was <2 x i64> and at was [2 x i64]*
+                assert(at == et || (et->isVectorTy() && at->isPointerTy()));
                 argvals[idx] = emit_unbox(et, emit_unboxed(args[i+1], ctx), jt);
                 assert(dyn_cast<UndefValue>(argvals[idx]) == 0);
             }
@@ -2967,7 +2968,7 @@ static void emit_assignment(jl_value_t *l, jl_value_t *r, jl_codectx_t *ctx)
         jl_value_t *declType = (jl_is_array(gensym_types) ? jl_cellref(gensym_types, idx) : (jl_value_t*)jl_any_type);
         Value *bp = NULL;
         if (store_unboxed_p(declType)) {
-            Type *vtype = julia_struct_to_llvm(declType);
+            Type *vtype = julia_struct_to_llvm_quick(declType);
             assert(vtype != jl_pvalue_llvmt);
             if (!type_is_ghost(vtype)) {
                 // add a stack slot for this (non-ghost) GenSym node
@@ -3555,6 +3556,7 @@ static Function *gen_cfun_wrapper(jl_function_t *ff, jl_value_t *jlrettype, jl_t
     if (fargt.size() != fargt_sig.size())
         jl_error("va_arg syntax not allowed for cfunction argument list");
 
+//printf("\tjlcapi_ %s globalUnique = %d\n",lam->name->name, int(globalUnique));
     std::stringstream funcName;
     funcName << "jlcapi_" << lam->name->name << "_" << globalUnique++;
 
@@ -3769,7 +3771,7 @@ static Function *gen_jlcall_wrapper(jl_lambda_info_t *lam, jl_expr_t *ast, Funct
     unsigned idx = 0;
     for(size_t i=0; i < nargs; i++) {
         jl_value_t *ty = jl_nth_slot_type(lam->specTypes, i);
-        Type *lty = julia_type_to_llvm(ty);
+        Type *lty = julia_type_to_llvm_quick(ty);
         if (lty != NULL && type_is_ghost(lty))
             continue;
         Value *argPtr = builder.CreateGEP(argArray,
@@ -3939,12 +3941,12 @@ static Function *emit_function(jl_lambda_info_t *lam)
 #else
     m = jl_Module;
 #endif
+//printf("\tname = %s globalUnique = %d\n",lam->name->name, int(globalUnique));
     funcName << "_" << globalUnique++;
-
     if (specsig) { // assumes !va
         std::vector<Type*> fsig(0);
         for(size_t i=0; i < jl_nparams(lam->specTypes); i++) {
-            Type *ty = julia_type_to_llvm(jl_tparam(lam->specTypes,i));
+            Type *ty = julia_type_to_llvm_quick(jl_tparam(lam->specTypes,i));
             if (type_is_ghost(ty)) {
                 // mark as a ghost for now, we'll revise this later if needed as a local
                 ctx.vars[jl_decl_var(jl_cellref(largs,i))].isGhost = true;
@@ -3954,7 +3956,7 @@ static Function *emit_function(jl_lambda_info_t *lam)
                 ty = PointerType::get(ty,0);
             fsig.push_back(ty);
         }
-        Type *rt = (jlrettype == (jl_value_t*)jl_void_type ? T_void : julia_type_to_llvm(jlrettype));
+        Type *rt = (jlrettype == (jl_value_t*)jl_void_type ? T_void : julia_type_to_llvm_quick(jlrettype));
         f = Function::Create(FunctionType::get(rt, fsig, false),
                              imaging_mode ? GlobalVariable::InternalLinkage : GlobalVariable::ExternalLinkage,
                              funcName.str(), m);
@@ -4676,14 +4678,14 @@ extern "C" void jl_fptr_to_llvm(void *fptr, jl_lambda_info_t *lam, int specsig)
             jl_value_t *jlrettype = jl_ast_rettype(lam, (jl_value_t*)lam->ast);
             std::vector<Type*> fsig(0);
             for (size_t i=0; i < jl_nparams(lam->specTypes); i++) {
-                Type *ty = julia_type_to_llvm(jl_tparam(lam->specTypes,i));
+                Type *ty = julia_type_to_llvm_quick(jl_tparam(lam->specTypes,i));
                 if (type_is_ghost(ty))
                     continue;
                 if (ty->isAggregateType())
                     ty = PointerType::get(ty,0);
                 fsig.push_back(ty);
             }
-            Type *rt = (jlrettype == (jl_value_t*)jl_void_type ? T_void : julia_type_to_llvm(jlrettype));
+            Type *rt = (jlrettype == (jl_value_t*)jl_void_type ? T_void : julia_type_to_llvm_quick(jlrettype));
             Function *f = Function::Create(FunctionType::get(rt, fsig, false), Function::ExternalLinkage, funcName,
                                            shadow_module);
 
