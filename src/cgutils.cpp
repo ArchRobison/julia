@@ -753,12 +753,7 @@ static Type *julia_struct_to_llvm(jl_value_t *jt)
             }
             else {
                 if (isvector && lasttype != T_int1 && !type_is_ghost(lasttype)) {
-                    // TODO: currently we get LLVM assertion failures for other vector sizes
-                    bool validVectorSize = (ntypes == 2 || ntypes == 4 || ntypes == 6);
-                    if (0 && lasttype->isSingleValueType() && !lasttype->isVectorTy() && validVectorSize) // currently disabled due to load/store alignment issues
-                        jst->struct_decl = VectorType::get(lasttype, ntypes);
-                    else
-                        jst->struct_decl = ArrayType::get(lasttype, ntypes);
+                    jst->struct_decl = ArrayType::get(lasttype, ntypes);
                 }
                 else {
                     jst->struct_decl = StructType::get(jl_LLVMContext,ArrayRef<Type*>(&latypes[0],ntypes));
@@ -768,6 +763,41 @@ static Type *julia_struct_to_llvm(jl_value_t *jt)
         return (Type*)jst->struct_decl;
     }
     return julia_type_to_llvm(jt);
+}
+
+static Type *llvm_outer(Type *ty, jl_value_t *jt) {
+    if (jl_is_tuple_type(jt) && ty->isArrayTy()) {
+        uint64_t n = ty->getArrayNumElements();
+        if (n==2 || n==4 || n==8 || n==16) {
+            const unsigned maxbits = 512;    // Big enough for AVX-512
+            Type* eltype = ty->getArrayElementType();
+            unsigned bitSize = 0;
+            if (eltype->isIntegerTy() || eltype->isFloatingPointTy())
+                bitSize = eltype->getPrimitiveSizeInBits();
+            else if(eltype->isPointerTy())
+                bitSize = 8*sizeof(void*);
+            else
+                // Probaby won't gain much to tupleize it.
+                return ty;
+            if (bitSize*n<=maxbits)
+                return VectorType::get(eltype, n);
+        }
+    }
+    return ty;
+}
+
+// Get LLVM type corresponding to given Julia type for
+// contexts where it is not an element of another type.
+static Type *julia_type_to_llvm_outer(jl_value_t *jt) {
+    Type *ty = julia_type_to_llvm(jt);
+    return llvm_outer(ty,jt);
+}
+
+// Get LLVM type corresponding to unboxed Julia type for
+// contexts where it is not an element of another type.
+static Type *julia_struct_to_llvm_outer(jl_value_t *jt) {
+    Type *ty = julia_struct_to_llvm(jt);
+    return llvm_outer(ty,jt);
 }
 
 static bool is_datatype_all_pointers(jl_datatype_t *dt)
@@ -799,7 +829,7 @@ static bool is_tupletype_homogeneous(jl_svec_t *t)
 static bool deserves_sret(jl_value_t *dt, Type *T)
 {
     assert(jl_is_datatype(dt));
-    return (size_t)jl_datatype_size(dt) > sizeof(void*) && !T->isFloatingPointTy();
+    return (size_t)jl_datatype_size(dt) > sizeof(void*) && !T->isFloatingPointTy() && !T->isVectorTy();
 }
 
 // --- generating various field accessors ---
@@ -1080,12 +1110,12 @@ static Value *emit_bounds_check(const jl_cgval_t &ainfo, jl_value_t *ty, Value *
 
 // --- loading and storing ---
 
-static Value *emit_unbox(Type *to, const jl_cgval_t &x, jl_value_t *jt);
+static Value *emit_unbox(Type *to, const jl_cgval_t &x, jl_value_t *jt, jl_codectx_t *ctx);
 
 static jl_cgval_t typed_load(Value *ptr, Value *idx_0based, jl_value_t *jltype,
                          jl_codectx_t *ctx, MDNode* tbaa, size_t alignment = 0)
 {
-    Type *elty = julia_type_to_llvm(jltype);
+    Type *elty = julia_type_to_llvm_outer(jltype);
     assert(elty != NULL);
     if (type_is_ghost(elty))
         return ghostValue(jltype);
@@ -1130,7 +1160,7 @@ static void typed_store(Value *ptr, Value *idx_0based, const jl_cgval_t &rhs,
                         Value* parent,  // for the write barrier, NULL if no barrier needed
                         size_t alignment = 0)
 {
-    Type *elty = julia_type_to_llvm(jltype);
+    Type *elty = julia_type_to_llvm_outer(jltype);
     assert(elty != NULL);
     if (type_is_ghost(elty))
         return;
@@ -1139,7 +1169,7 @@ static void typed_store(Value *ptr, Value *idx_0based, const jl_cgval_t &rhs,
     }
     Value *r;
     if (jl_isbits(jltype) && ((jl_datatype_t*)jltype)->size > 0) {
-        r = emit_unbox(elty, rhs, jltype);
+        r = emit_unbox(elty, rhs, jltype, ctx);
     }
     else {
         r = boxed(rhs, ctx, jltype);
@@ -1332,7 +1362,7 @@ static bool emit_getfield_unknownidx(jl_cgval_t *ret, const jl_cgval_t &strct, V
 static jl_cgval_t emit_getfield_knownidx(const jl_cgval_t &strct, unsigned idx, jl_datatype_t *jt, jl_codectx_t *ctx)
 {
     jl_value_t *jfty = jl_field_type(jt,idx);
-    Type *elty = julia_type_to_llvm(jfty);
+    Type *elty = julia_type_to_llvm_outer(jfty);
     assert(elty != NULL);
     if (jfty == jl_bottom_type) {
         raise_exception_unless(ConstantInt::get(T_int1,0), prepare_global(jlundeferr_var), ctx);
@@ -1537,7 +1567,7 @@ static Value *emit_array_nd_index(const jl_cgval_t &ainfo, jl_value_t *ex, size_
 #endif
     Value **idxs = (Value**)alloca(sizeof(Value*)*nidxs);
     for(size_t k=0; k < nidxs; k++) {
-        idxs[k] = emit_unbox(T_size, emit_unboxed(args[k], ctx), NULL);
+        idxs[k] = emit_unbox(T_size, emit_unboxed(args[k], ctx), NULL, ctx);
     }
     for(size_t k=0; k < nidxs; k++) {
         Value *ii = builder.CreateSub(idxs[k], ConstantInt::get(T_size, 1));
@@ -1607,6 +1637,7 @@ static jl_value_t *static_void_instance(jl_value_t *jt)
     return (jl_value_t*)jb->instance;
 }
 
+// Construct Julia representation of an LLVM constant.
 static jl_value_t *static_constant_instance(Constant *constant, jl_value_t *jt)
 {
     assert(constant != NULL);
@@ -1645,22 +1676,24 @@ static jl_value_t *static_constant_instance(Constant *constant, jl_value_t *jt)
         }
     }
 
-    size_t nargs = 0;
-    ConstantStruct *cst = NULL;
-    ConstantVector *cvec = NULL;
-    ConstantArray *carr = NULL;
-    if ((cst = dyn_cast<ConstantStruct>(constant)) != NULL)
-        nargs = cst->getType()->getNumElements();
-    else if ((cvec = dyn_cast<ConstantVector>(constant)) != NULL)
-        nargs = cvec->getType()->getNumElements();
-    else if ((carr = dyn_cast<ConstantArray>(constant)) != NULL)
-        nargs = carr->getType()->getNumElements();
-    else if (isa<Function>(constant))
+    if (isa<Function>(constant))
         return NULL;
-    else
-        assert(false && "Cannot process this type of constant");
 
     assert(jl_is_tuple_type(jt));
+    // Inspect the constant's type, not the constant itself, to avoid
+    // having to list all of LLVM's plethora of constant representations.
+    size_t nargs;
+    Type *ct = constant->getType();
+    if (ArrayType *at = dyn_cast<ArrayType>(ct)) {
+        nargs = at->getArrayNumElements();
+    } else if (VectorType *vt = dyn_cast<VectorType>(ct)) {
+        nargs = vt->getVectorNumElements();
+    } else if (StructType *st = dyn_cast<StructType>(ct)) {
+        nargs = st->getStructNumElements();
+    } else {
+        assert(false && "Cannot process this type of constant");
+        nargs = 0;
+    }
 
     jl_value_t **tupleargs;
     JL_GC_PUSHARGS(tupleargs, nargs);
@@ -1710,7 +1743,7 @@ static Value *boxed(const jl_cgval_t &vinfo, jl_codectx_t *ctx, jl_value_t *jt)
         assert(s);
         return literal_pointer_val(s);
     }
-    Type *t = julia_type_to_llvm(vinfo.typ);
+    Type *t = julia_type_to_llvm_outer(vinfo.typ);
     assert(!type_is_ghost(t)); // should have been handled by isghost above!
 
     if (vinfo.isboxed)
@@ -1895,7 +1928,7 @@ static jl_cgval_t emit_new_struct(jl_value_t *ty, size_t nargs, jl_value_t **arg
     size_t nf = jl_datatype_nfields(sty);
     if (nf > 0) {
         if (jl_isbits(sty)) {
-            Type *lt = julia_type_to_llvm(ty);
+            Type *lt = julia_type_to_llvm_outer(ty);
             size_t na = nargs-1 < nf ? nargs-1 : nf;
             Value *strct = UndefValue::get(lt == T_void ? NoopType : lt);
             unsigned idx = 0;
@@ -1906,7 +1939,7 @@ static jl_cgval_t emit_new_struct(jl_value_t *ty, size_t nargs, jl_value_t **arg
                 if (!jl_subtype(fval_info.typ, jtype, 0))
                     emit_typecheck(fval_info, jtype, "new", ctx);
                 if (!type_is_ghost(fty)) {
-                    Value *fval = emit_unbox(fty, fval_info, jtype);
+                    Value *fval = emit_unbox(fty, fval_info, jtype, ctx);
                     if (fty == T_int1)
                         fval = builder.CreateZExt(fval, T_int8);
                     if (lt->isVectorTy())

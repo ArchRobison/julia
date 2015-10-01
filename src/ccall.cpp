@@ -365,7 +365,7 @@ static Value *julia_to_native(Type *to, jl_value_t *jlto, const jl_cgval_t &jvin
     }
 
     if (!addressOf && !byRef)
-        return emit_unbox(to, jvinfo, ety);
+        return emit_unbox(to, jvinfo, ety, ctx);
 
     if (addressOf && jvinfo.isboxed) {
         if (!jl_is_abstracttype(ety)) {
@@ -434,7 +434,7 @@ static Value *julia_to_native(Type *to, jl_value_t *jlto, const jl_cgval_t &jvin
         to = to->getContainedType(0);
     Value *slot = emit_static_alloca(to, ctx);
     if (!jvinfo.ispointer)
-        builder.CreateStore(emit_unbox(to, jvinfo, ety), slot);
+        builder.CreateStore(emit_unbox(to, jvinfo, ety, ctx), slot);
     else
         builder.CreateMemCpy(slot, jvinfo.V, (uint64_t)jl_datatype_size(ety), (uint64_t)((jl_datatype_t*)ety)->alignment);
     return slot;
@@ -465,7 +465,7 @@ static native_sym_arg_t interpret_symbol_arg(jl_value_t *arg, jl_codectx_t *ctx,
                                ctx);
         }
         arg1 = remark_julia_type(arg1, (jl_value_t*)jl_voidpointer_type);
-        jl_ptr = emit_unbox(T_size, arg1, (jl_value_t*)jl_voidpointer_type);
+        jl_ptr = emit_unbox(T_size, arg1, (jl_value_t*)jl_voidpointer_type, ctx);
     }
 
     void *fptr=NULL;
@@ -1133,7 +1133,7 @@ static jl_cgval_t emit_ccall(jl_value_t **args, size_t nargs, jl_codectx_t *ctx)
         }
         else {
             assert(!addressOf);
-            ary = emit_unbox(largty, emit_unboxed(argi, ctx), tti);
+            ary = emit_unbox(largty, emit_unboxed(argi, ctx), tti, ctx);
         }
         JL_GC_POP();
         return mark_or_box_ccall_result(builder.CreateBitCast(ary, lrt),

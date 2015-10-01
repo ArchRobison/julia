@@ -260,8 +260,21 @@ static jl_cgval_t emit_unboxed(jl_value_t *e, jl_codectx_t *ctx)
 
 static jl_cgval_t ghostValue(jl_value_t *ty);
 
+// logic for emit_unbox for case where x is pointer to non-ghost value.
+static Value *emit_unpoint(Type *to, const jl_cgval_t &x) {
+    assert(!x.isghost);
+    assert(x.ispointer);
+    Value *v = builder.CreatePointerCast(x.V, to->getPointerTo());
+    if(to->isVectorTy() && x.V->getType()->getPointerElementType()->isArrayTy()) {
+        assert(jl_is_tuple_type(x.typ));
+        // LLVM array representation might not be aligned on natural vector boundary.
+        return builder.CreateAlignedLoad(v, ((jl_datatype_t*)x.typ)->alignment);
+    }
+    return builder.CreateLoad(v);
+}
+
 // emit code to unpack a raw value from a box into registers
-static Value *emit_unbox(Type *to, const jl_cgval_t &x, jl_value_t *jt)
+static Value *emit_unbox(Type *to, const jl_cgval_t &x, jl_value_t *jt, jl_codectx_t *ctx)
 {
     assert(to != jl_pvalue_llvmt);
     // TODO: fully validate that x.typ == jt?
@@ -273,17 +286,20 @@ static Value *emit_unbox(Type *to, const jl_cgval_t &x, jl_value_t *jt)
         return UndefValue::get(to); // type mismatch error
     }
     if (!x.isboxed) { // already unboxed, but sometimes need conversion
-        Value *unboxed;
         if (x.ispointer) {
+            // Cast the pointer and load
             if (jt == (jl_value_t*)jl_bool_type && to != T_int1)
                 return builder.CreateZExt(builder.CreateLoad(builder.CreatePointerCast(x.V, T_int1->getPointerTo())), to);
             else
-                return builder.CreateLoad(builder.CreatePointerCast(x.V, to->getPointerTo()));
+                return emit_unpoint(to, x);
         }
-        else {
-            unboxed = x.V;
-        }
+        Value *unboxed = x.V;
         Type *ty = unboxed->getType();
+        // Test for common case.  Experiment on 2015-10-1 indicated that during precompilation 
+        // of Julia libraries, less than 0.3% of executions reached here with ty!=to.
+        if (ty==to) {
+            return unboxed;
+        }
         // bools are stored internally as int8 (for now)
         if (ty == T_int1 && to == T_int8)
             return builder.CreateZExt(unboxed, T_int8);
@@ -294,6 +310,20 @@ static Value *emit_unbox(Type *to, const jl_cgval_t &x, jl_value_t *jt)
         if (ty->isPointerTy() && to->isPointerTy())
             // pointer types are going away anyways, and this can come up in ccall argument conversion
             return builder.CreatePointerCast(unboxed, to);
+        if (ty->isVectorTy() && to->isArrayTy()) {
+            assert(jl_is_tuple_type(x.typ));
+            assert(ty->getVectorNumElements()==to->getArrayNumElements());
+            Value *mem = emit_static_alloca(ty, ctx);
+            builder.CreateStore(unboxed, mem);          // Aligned store
+            return builder.CreateLoad(builder.CreatePointerCast(mem, to->getPointerTo()));
+        }
+        if (ty->isArrayTy() && to->isVectorTy()) {
+            assert(jl_is_tuple_type(x.typ));
+            assert(ty->getArrayNumElements()==to->getVectorNumElements());
+            Value *mem = emit_static_alloca(to, ctx);
+            builder.CreateStore(unboxed, builder.CreatePointerCast(mem, ty->getPointerTo()));
+            return builder.CreateLoad(mem);             // Aligned load
+        }
         if (ty != to) {
             // this can happen when a branch yielding a different type ends
             // up being dead code, and type inference knows that the other
@@ -335,7 +365,7 @@ static Value *auto_unbox(const jl_cgval_t &v, jl_codectx_t *ctx)
         return NULL;
     }
     assert(!to->isAggregateType()); // expecting some sort of jl_bitstype
-    return emit_unbox(to, v, bt);
+    return emit_unbox(to, v, bt, ctx);
 }
 static Value *auto_unbox(jl_value_t *x, jl_codectx_t *ctx)
 {
@@ -426,7 +456,7 @@ static jl_cgval_t generic_box(jl_value_t *targ, jl_value_t *x, jl_codectx_t *ctx
         Value *newobj = emit_allocobj(nb);
         builder.CreateStore(runtime_bt, emit_typeptr_addr(newobj));
         if (!v.ispointer)
-            builder.CreateAlignedStore(emit_unbox(llvmt, v, v.typ), builder.CreatePointerCast(newobj, llvmt->getPointerTo()), alignment);
+            builder.CreateAlignedStore(emit_unbox(llvmt, v, v.typ, ctx), builder.CreatePointerCast(newobj, llvmt->getPointerTo()), alignment);
         else
             builder.CreateMemCpy(newobj, builder.CreateBitCast(v.V, T_pint8), nb, alignment);
         return mark_julia_type(newobj, bt ? bt : (jl_value_t*)jl_any_type);
@@ -639,7 +669,7 @@ static jl_cgval_t emit_pointerref(jl_value_t *e, jl_value_t *i, jl_codectx_t *ct
         return emit_runtime_pointerref(e, i, ctx);
         //jl_error("pointerref: invalid index type");
     Value *thePtr = auto_unbox(e,ctx);
-    Value *idx = emit_unbox(T_size, emit_unboxed(i, ctx), (jl_value_t*)jl_long_type);
+    Value *idx = emit_unbox(T_size, emit_unboxed(i, ctx), (jl_value_t*)jl_long_type, ctx);
     Value *im1 = builder.CreateSub(idx, ConstantInt::get(T_size, 1));
     if (!jl_isbits(ety)) {
         if (ety == (jl_value_t*)jl_any_type)
@@ -708,7 +738,7 @@ static jl_cgval_t emit_pointerset(jl_value_t *e, jl_value_t *x, jl_value_t *i, j
     if (expr_type(i, ctx) != (jl_value_t*)jl_long_type)
         return emit_runtime_pointerset(e, x, i, ctx);
         //jl_error("pointerset: invalid index type");
-    Value *idx = emit_unbox(T_size, emit_unboxed(i, ctx),(jl_value_t*)jl_long_type);
+    Value *idx = emit_unbox(T_size, emit_unboxed(i, ctx),(jl_value_t*)jl_long_type, ctx);
     Value *im1 = builder.CreateSub(idx, ConstantInt::get(T_size, 1));
     Value *thePtr = auto_unbox(e,ctx);
     if (!jl_isbits(ety) && ety != (jl_value_t*)jl_any_type) {
@@ -943,7 +973,7 @@ static jl_cgval_t emit_intrinsic(intrinsic f, jl_value_t **args, size_t nargs,
         Value *isfalse = emit_condition(args[1], "select_value", ctx); // emit the first argument
         jl_value_t *t1 = expr_type(args[2], ctx);
         jl_value_t *t2 = expr_type(args[3], ctx);
-        Type *llt1 = julia_type_to_llvm(t1);
+        Type *llt1 = julia_type_to_llvm_outer(t1);
         Value *ifelse_result;
         if (llt1 != jl_pvalue_llvmt && t1 == t2) {
             // emit X and Y arguments
@@ -959,11 +989,9 @@ static jl_cgval_t emit_intrinsic(intrinsic f, jl_value_t **args, size_t nargs,
             if (y.V->getType() == T_void)
                 return x;
             // ensure that X and Y have the same llvm Type
-            Value *vx = x.V, *vy = y.V;
-            if (x.ispointer) // TODO: elid this load if unnecessary
-                vx = builder.CreateLoad(builder.CreatePointerCast(vx, llt1->getPointerTo(0)));
-            if (y.ispointer) // TODO: elid this load if unnecessary
-                vy = builder.CreateLoad(builder.CreatePointerCast(vy, llt1->getPointerTo(0)));
+            // TODO: elide loads if unnecessary.  Or will LLVM do this for us?
+            Value *vx = x.ispointer ? emit_unpoint(llt1, x) : x.V;
+            Value *vy = y.ispointer ? emit_unpoint(llt1, y) : y.V;
             ifelse_result = builder.CreateSelect(isfalse, vy, vx);
             return mark_julia_type(ifelse_result, t2);
         }
